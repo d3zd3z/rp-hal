@@ -1,15 +1,30 @@
+//! This is the IRQ controller.  It should have doc comments.
+
 use core::{marker::PhantomData, ops::Deref};
 use embedded_hal::blocking::i2c::{Read, Write, WriteIter, WriteIterRead, WriteRead};
 use fugit::HertzU32;
 
 #[cfg(feature = "eh1_0_alpha")]
 use eh1_0_alpha::i2c as eh1;
+use rtic::Mutex;
+use rtic_sync::channel::{Receiver, Sender};
 
 use super::{i2c_reserved_addr, Controller, Error, ValidPinScl, ValidPinSda, I2C};
 use crate::{
     pac::{i2c0::RegisterBlock as Block, RESETS},
     resets::SubsystemReset,
 };
+
+/// Information returned from interrupts.
+pub enum ControllerIrqInfo {
+    /// An abort condition happened.
+    Abort(u32),
+    /// The stop condition happened.
+    Stop,
+}
+
+/// The Receiver to wait for interrupts.
+pub type ControllerIrqWait<'a, const N: usize> = Receiver<'a, ControllerIrqInfo, N>;
 
 impl<T, Sda, Scl> I2C<T, (Sda, Scl), Controller>
 where
@@ -47,6 +62,10 @@ where
         // Clear FIFO threshold
         i2c.ic_tx_tl.write(|w| unsafe { w.tx_tl().bits(0) });
         i2c.ic_rx_tl.write(|w| unsafe { w.rx_tl().bits(0) });
+
+        // Clear all interrupts.
+        i2c.ic_clr_intr.read();
+        i2c.ic_intr_mask.write(|w| unsafe { w.bits(0) });
 
         let freq_in = system_clock.to_Hz();
 
@@ -192,9 +211,37 @@ impl<T: Deref<Target = Block>, PINS> I2C<T, PINS, Controller> {
         Ok(())
     }
 
+    /// Issue the given bytes as a write to the specified target.  This will
+    /// only block if the transmit fifo fills up, and does not wait upon completion.
+    /// The `do_stop` flag indicates that the last written value should initiate
+    /// a I2C bus stop.  This will stop early if an abort is detected, but does
+    /// not handle that error in any way.
     fn write_internal(&mut self, bytes: &[u8], do_stop: bool) -> Result<(), Error> {
+        let mut pos = 0;
+        while pos < bytes.len() {
+            pos += self.write_internal_partial(&bytes[pos..], do_stop)?;
+
+            // If the transmit fifo is full, need to wait.
+            if pos < bytes.len() {
+                todo!();
+            }
+        }
+        Ok(())
+    }
+
+    fn write_internal_partial(&mut self, bytes: &[u8], do_stop: bool) -> Result<usize, Error> {
         for (i, byte) in bytes.iter().enumerate() {
             let last = i == bytes.len() - 1;
+
+            // If the transmit fifo is full, we need to wait until it has room.
+            // TODO: This can wait for an appropriate interrupt for a threshold.
+            // Which will require changing the meaning of the TX_EMPTY_CTRL flag.
+            // TODO: Change this to always write, and detect the TX_OVER
+            // interrupt. It doesn't seem like we can change the threshold.  I
+            // wonder if this was intended to be used by DMA.
+            if self.i2c.ic_status.read().tfnf().is_full() {
+                return Ok(i);
+            }
 
             self.i2c.ic_data_cmd.write(|w| {
                 if do_stop && last {
@@ -205,31 +252,77 @@ impl<T: Deref<Target = Block>, PINS> I2C<T, PINS, Controller> {
                 unsafe { w.dat().bits(*byte) }
             });
 
-            // Wait until the transmission of the address/data from the internal
-            // shift register has completed. For this to function correctly, the
-            // TX_EMPTY_CTRL flag in IC_CON must be set. The TX_EMPTY_CTRL flag
-            // was set in i2c_init.
-            while self.i2c.ic_raw_intr_stat.read().tx_empty().is_inactive() {}
-
-            let abort_reason = self.read_and_clear_abort_reason();
-
-            if abort_reason.is_some() || (do_stop && last) {
-                // If the transaction was aborted or if it completed
-                // successfully wait until the STOP condition has occured.
-
-                while self.i2c.ic_raw_intr_stat.read().stop_det().is_inactive() {}
-
-                self.i2c.ic_clr_stop_det.read().clr_stop_det();
-            }
-
-            // Note the hardware issues a STOP automatically on an abort condition.
-            // Note also the hardware clears RX FIFO as well as TX on abort,
-            // ecause we set hwparam IC_AVOID_RX_FIFO_FLUSH_ON_TX_ABRT to 0.
-            if let Some(abort_reason) = abort_reason {
-                return Err(Error::Abort(abort_reason));
+            // If, at any time, we see an abort, stop all of this.
+            if self.i2c.ic_raw_intr_stat.read().tx_abrt().is_active() {
+                break;
             }
         }
+        Ok(bytes.len())
+    }
+
+
+    // /// Rtic async version of above.
+    // async fn write_internal_async<M>(me: &M, bytes: &[u8], do_stop: bool) -> Result<(), Error>
+    // {
+    //     unimplemented!()
+    // }
+
+    /// Wait for the I2c bus to stop.  Can  return indicating an abort happened.
+    /// Blocking version.
+    fn wait_stop(&mut self) -> Result<(), Error> {
+        let mut abort = None;
+        loop {
+            let reg = self.i2c.ic_raw_intr_stat.read();
+            // If we get an abort, read it.  But we still wait for a stop.
+            if reg.tx_abrt().is_active() {
+                abort = Some(self.i2c.ic_tx_abrt_source.read().bits());
+                self.i2c.ic_clr_tx_abrt.read();
+            }
+            if reg.stop_det().is_active() {
+                self.i2c.ic_clr_stop_det.read();
+                break;
+            }
+        };
+
+        if let Some(abort) = abort {
+            return Err(Error::Abort(abort));
+        }
+
         Ok(())
+    }
+
+    async fn wait_stop_async<'a, const N: usize>(irq: &mut ControllerIrqWait<'a, N>) -> Result<(), Error> {
+        let mut abort = None;
+
+        loop {
+            match irq.recv().await {
+                Ok(ControllerIrqInfo::Abort(count)) => abort = Some(count),
+                Ok(ControllerIrqInfo::Stop) => break,
+                Err(_) => return Err(Error::IrqError),
+            }
+        }
+
+        if let Some(abort) = abort {
+            return Err(Error::Abort(abort));
+        }
+
+        Ok(())
+    }
+
+    /// The actual interrupt handler.  Any events received should be sent to the
+    /// given channel.
+    pub fn handle_irq<'a, const N: usize>(&mut self, chan: &mut Sender<'a, ControllerIrqInfo, N>) {
+        let reg = self.i2c.ic_intr_stat.read();
+        // defmt::info!("i2c irq: {:x}", reg.bits());
+        if reg.r_tx_abrt().is_active() {
+            let abort = self.i2c.ic_tx_abrt_source.read().bits();
+            self.i2c.ic_clr_tx_abrt.read();
+            let _ = chan.try_send(ControllerIrqInfo::Abort(abort));
+        }
+        if reg.r_stop_det().is_active() {
+            self.i2c.ic_clr_stop_det.read();
+            let _ = chan.try_send(ControllerIrqInfo::Stop);
+        }
     }
 
     /// Writes bytes to slave with address `address`
@@ -241,6 +334,10 @@ impl<T: Deref<Target = Block>, PINS> I2C<T, PINS, Controller> {
     where
         B: IntoIterator<Item = u8>,
     {
+        if true {
+            return Err(Error::Todo);
+        }
+
         let mut peekable = bytes.into_iter().peekable();
         let addr: u16 = address.into();
         Self::validate(addr, Some(peekable.peek().is_none()), None)?;
@@ -267,6 +364,10 @@ impl<T: Deref<Target = Block>, PINS> I2C<T, PINS, Controller> {
     where
         B: IntoIterator<Item = u8>,
     {
+        if true {
+            return Err(Error::Todo);
+        }
+
         let mut peekable = bytes.into_iter().peekable();
         let addr: u16 = address.into();
         Self::validate(addr, Some(peekable.peek().is_none()), None)?;
@@ -296,6 +397,9 @@ impl<T: Deref<Target = Block>, PINS> I2C<T, PINS, Controller> {
     where
         O: IntoIterator<Item = eh1::Operation<'a>>,
     {
+        if true {
+            return Err(Error::Todo);
+        }
         let addr: u16 = address.into();
         self.setup(addr);
         let mut peekable = operations.into_iter().peekable();
@@ -307,6 +411,49 @@ impl<T: Deref<Target = Block>, PINS> I2C<T, PINS, Controller> {
             }
         }
         Ok(())
+    }
+
+    /// Async (rtic) write method.
+    pub async fn write_async<'a, const N: usize, M: Mutex<T=Self>>(i2c: &mut M, irq: &mut ControllerIrqWait<'a, N>, addr: u8, tx: &[u8]) -> Result<(), Error> {
+        let addr: u16 = addr.into();
+        Self::validate(addr, Some(tx.is_empty()), None)?;
+        i2c.lock(|i2c| i2c.setup(addr));
+
+        i2c.lock(|i2c| {
+            i2c.i2c.ic_intr_mask.write(|w| {
+                unsafe { w.bits(0); }
+                w.m_stop_det().set_bit();
+                w.m_tx_abrt().set_bit();
+                w
+            });
+            // i2c.i2c.ic_intr_mask.modify(|_, w| {
+            //     w.m_stop_det().set_bit();
+            //     w.m_tx_abrt().set_bit()
+            // });
+            // defmt::info!("irq mask: 0x{:x}", i2c.i2c.ic_intr_mask.read().bits());
+        });
+
+        let mut pos = 0;
+        while pos < tx.len() {
+            pos += i2c.lock(|i2c| i2c.write_internal_partial(&tx[pos..], true))?;
+
+            if pos < tx.len() {
+                // TODO: async block for some kind of interrupt.
+                todo!();
+            }
+        }
+
+        let result = Self::wait_stop_async(irq).await?;
+
+        i2c.lock(|i2c| {
+            i2c.i2c.ic_intr_mask.write(|w| unsafe { w.bits(0) });
+            // i2c.i2c.ic_intr_mask.modify(|_, w| {
+            //     w.m_stop_det().set_bit();
+            //     w.m_tx_abrt().set_bit()
+            // });
+        });
+
+        Ok(result)
     }
 }
 
@@ -326,6 +473,9 @@ impl<T: Deref<Target = Block>, PINS> WriteRead for I2C<T, PINS, Controller> {
     type Error = Error;
 
     fn write_read(&mut self, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), Error> {
+        if true {
+            return Err(Error::Todo);
+        }
         let addr: u16 = addr.into();
 
         Self::validate(addr, Some(tx.is_empty()), Some(rx.is_empty()))?;
@@ -344,7 +494,8 @@ impl<T: Deref<Target = Block>, PINS> Write for I2C<T, PINS, Controller> {
         Self::validate(addr, Some(tx.is_empty()), None)?;
         self.setup(addr);
 
-        self.write_internal(tx, true)
+        self.write_internal(tx, true)?;
+        self.wait_stop()
     }
 }
 

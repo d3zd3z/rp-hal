@@ -53,7 +53,7 @@ use crate::{
     typelevel::Sealed,
 };
 
-mod controller;
+pub mod controller;
 pub mod peripheral;
 
 /// Pac I2C device
@@ -98,6 +98,10 @@ pub enum Error {
     AddressOutOfRange(u16),
     /// Target i2c address is reserved
     AddressReserved(u16),
+    /// Error with interrupt channel.
+    IrqError,
+    /// Feature not implemented correctly yet.
+    Todo,
 }
 
 #[cfg(feature = "eh1_0_alpha")]

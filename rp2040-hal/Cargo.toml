@@ -44,6 +44,10 @@ frunk = { version = "0.4.1", default-features = false }
 
 bitfield = { version = "0.14.0" }
 
+# TODO: Create an embassy feature.
+rtic = { version = "2.0.1" }
+rtic-sync = "1.0.2"
+
 [dev-dependencies]
 cortex-m-rt = "0.7"
 cortex-m-rtic = "1.1.4"
